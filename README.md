@@ -25,7 +25,6 @@ This addon is built specifically for **PhoenixXI**'s LandSandBoat fork. The guil
    ```
    Ashita/addons/guildcompanion/guildcompanion.lua
    Ashita/addons/guildcompanion/data/shop_data.lua
-   Ashita/addons/guildcompanion/data/vendor_floor.lua
    ```
 4. In-game: `/addon load guildcompanion`
 

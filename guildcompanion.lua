@@ -88,9 +88,8 @@ local function reset_settings()
     save_settings();
 end
 
--- Static data tables (built from era_guild_shops.lua / item_basic.sql / synth-finder audit)
-local ShopData    = require('data.shop_data');
-local VendorFloor = require('data.vendor_floor');
+-- Static data tables (built from era_guild_shops.lua / item_basic.sql)
+local ShopData = require('data.shop_data');
 
 ------------------------------------------------------------
 -- Helper NPCs that share another NPC's stock (era_guild_shops.lua's
@@ -179,24 +178,11 @@ local function reverseStockFromPrice(observedPrice, buyMax, priceFloor, targetSt
     local lo, hi = nil, nil;
     for s = 0, targetStock do
         if (calcBuyPrice(buyMax, priceFloor, maxStock, s) == observedPrice) then
-            if (not lo) then
-                lo = s;
-            end
+            lo = lo or s;
             hi = s;
         end
     end
     return lo, hi;
-end
-
-------------------------------------------------------------
--- "Cheaper elsewhere" check against infinite-stock vendor data
-------------------------------------------------------------
-local function checkUndercut(itemId, currentPrice)
-    local floor = VendorFloor[itemId];
-    if (not floor) then
-        return false, nil;
-    end
-    return floor.price < currentPrice, floor.price;
 end
 
 ------------------------------------------------------------
@@ -217,18 +203,16 @@ end
 
 ------------------------------------------------------------
 -- Reverse lookup for the sell side: given the price the packet reports,
--- find which current stock level(s) produce it. Real stock for selling
--- ranges from targetStock (the day's starting point after the daily trim)
--- up to maxStock (as players sell more) -- the opposite direction from
--- the buy side, so the search range is [targetStock, maxStock].
+-- find which current stock level(s) produce it. Buying and selling share
+-- one stock pool, so current stock can be anywhere in [0, maxStock] --
+-- not just [targetStock, maxStock] -- if other players have been buying
+-- that same day. searchFloor is normally 0; callers may narrow it.
 ------------------------------------------------------------
-local function reverseStockFromSellPrice(observedPrice, base, maxStock, targetStock)
+local function reverseStockFromSellPrice(observedPrice, base, maxStock, searchFloor)
     local lo, hi = nil, nil;
-    for s = targetStock, maxStock do
+    for s = searchFloor, maxStock do
         if (calcSellPrice(base, maxStock, s) == observedPrice) then
-            if (not lo) then
-                lo = s;
-            end
+            lo = lo or s;
             hi = s;
         end
     end
@@ -245,19 +229,16 @@ local function evaluateItem(npcItems, itemId, observedPrice)
     end
 
     if (d.fixedPrice) then
-        local undercut, elsewherePrice = checkUndercut(itemId, d.fixedPrice);
         return {
-            itemId           = itemId,
-            name             = d.name,
-            order            = d.order,
-            currentPrice     = d.fixedPrice,
-            priceRange       = { d.fixedPrice, d.fixedPrice },
-            daysToBest       = nil, -- n/a: price never moves for this item
-            sellCapacity     = d.maxStock,
-            restocks         = false, -- fixed-price items don't restock via the curve
-            restockPerDay    = nil,
-            cheaperElsewhere = undercut,
-            elsewherePrice   = elsewherePrice,
+            itemId        = itemId,
+            name          = d.name,
+            order         = d.order,
+            currentPrice  = d.fixedPrice,
+            priceRange    = { d.fixedPrice, d.fixedPrice },
+            daysToBest    = nil, -- n/a: price never moves for this item
+            sellCapacity  = d.maxStock,
+            restocks      = false, -- fixed-price items don't restock via the curve
+            restockPerDay = nil,
         };
     end
 
@@ -271,21 +252,17 @@ local function evaluateItem(npcItems, itemId, observedPrice)
         daysLo = math.max(0, math.ceil((d.targetStock - hi) / d.restockRate));
     end
 
-    local undercut, elsewherePrice = checkUndercut(itemId, observedPrice);
-
     return {
-        itemId           = itemId,
-        name             = d.name,
-        order            = d.order,
-        currentPrice     = observedPrice,
-        priceRange       = { minPrice, maxPrice },
-        stockBracket     = { lo, hi },
-        daysToBest       = { daysLo, daysHi },
-        sellCapacity     = d.maxStock,
-        restocks         = d.restockRate > 0,
-        restockPerDay    = d.restockRate,
-        cheaperElsewhere = undercut,
-        elsewherePrice   = elsewherePrice,
+        itemId        = itemId,
+        name          = d.name,
+        order         = d.order,
+        currentPrice  = observedPrice,
+        priceRange    = { minPrice, maxPrice },
+        stockBracket  = { lo, hi },
+        daysToBest    = { daysLo, daysHi },
+        sellCapacity  = d.maxStock,
+        restocks      = d.restockRate > 0,
+        restockPerDay = d.restockRate,
     };
 end
 
@@ -498,18 +475,29 @@ local function fmtRange(range)
     return string.format('%d - %d', range[1], range[2]);
 end
 
-local function fmtStock(stockBracket)
-    if (stockBracket == nil) then
-        return 'n/a'; -- fixed-price items have no meaningful stock estimate
+-- Shared formatter for any {lo, hi} bracket (stock estimate, days-to-best).
+-- noMatchLabel is shown when the observed value didn't land on the curve
+-- at all -- '?' for stock (worth flagging as a data mismatch), 'n/a' elsewhere.
+local function fmtBracket(bracket, noMatchLabel)
+    if (bracket == nil) then
+        return 'n/a';
     end
-    local lo, hi = stockBracket[1], stockBracket[2];
+    local lo, hi = bracket[1], bracket[2];
     if (lo == nil) then
-        return '?'; -- observed price didn't match any point on the curve -- data mismatch, worth flagging
+        return noMatchLabel;
     end
     if (lo == hi) then
         return tostring(lo);
     end
     return string.format('%d-%d', lo, hi);
+end
+
+local function fmtStock(stockBracket)
+    return fmtBracket(stockBracket, '?'); -- fixed-price items: n/a; no curve match: ? (data mismatch)
+end
+
+local function fmtDays(daysToBest)
+    return fmtBracket(daysToBest, 'n/a');
 end
 
 local function fmtRestock(restockPerDay)
@@ -524,20 +512,6 @@ local function fmtSellable(sellable)
         return 'n/a';
     end
     return tostring(sellable);
-end
-
-local function fmtDays(daysToBest)
-    if (daysToBest == nil) then
-        return 'n/a';
-    end
-    local lo, hi = daysToBest[1], daysToBest[2];
-    if (lo == nil) then
-        return 'n/a';
-    end
-    if (lo == hi) then
-        return tostring(lo);
-    end
-    return string.format('%d-%d', lo, hi);
 end
 
 ------------------------------------------------------------
@@ -574,9 +548,7 @@ end);
 
 ------------------------------------------------------------
 -- Menu-close detection via client memory, NOT packets.
--- This reads the game's own current-menu-name pointer directly (same
--- technique used by community addons like minimapcontrol) so it works
--- regardless of what LSB does or doesn't send when a shop menu closes.
+-- This reads the game's own current-menu-name pointer directly
 -- Read-only: this only reads memory, never writes to it.
 ------------------------------------------------------------
 local pGameMenu = ashita.memory.find('FFXiMain.dll', 0, '8B480C85C974??8B510885D274??3B05', 16, 0);
@@ -649,40 +621,79 @@ ashita.events.register('packet_in', 'guildcompanion_packet_in', function (e)
     end
 end);
 
-local gMenuClosedFrames    = 0;
+local gMenuClosedFrames = 0;
 
-ashita.events.register('d3d_present', 'guildcompanion_present', function ()
-    -- Poll menu state every frame so we catch the shop closing entirely,
-    -- even if LSB never sends a clean "closed" packet (confirmed: 0x086
-    -- only ever fires once, on open, never on close of any kind -- it's
-    -- not usable as a close signal at all). Debounced since some submenu
-    -- transitions can briefly read as "no menu" for a frame or two.
-    if (#gCurrentView > 0 or #gCurrentSellView > 0) then
-        local isMenuOpen = getCurrentMenuName() ~= '';
-        if (not isMenuOpen) then
-            gMenuClosedFrames = gMenuClosedFrames + 1;
-        else
-            gMenuClosedFrames = 0;
-        end
+------------------------------------------------------------
+-- Small helpers to cut down repetition in the render functions below
+------------------------------------------------------------
 
-        if (gMenuClosedFrames >= 15 and gSettings.auto_hide_on_close) then
-            gCurrentView      = T{};
-            gCurrentSellView  = T{};
-            gBuyAccum         = {};
-            gSellAccum        = {};
-            gMenuClosedFrames = 0;
-        end
+-- Applies the window's size: forced (ImGuiCond_Always) for one frame right
+-- after the UI Scale slider changes, otherwise only on first creation.
+local function applyScaledWindowSize(width, height)
+    local cond = gPendingResize and ImGuiCond_Always or ImGuiCond_FirstUseEver;
+    imgui.SetNextWindowSize({ width * gSettings.ui_scale, height * gSettings.ui_scale }, cond);
+end
+
+-- A single boolean setting rendered as a checkbox, saved on change.
+local function settingsCheckbox(label, key)
+    local ref = { gSettings[key] };
+    if (imgui.Checkbox(label, ref)) then
+        gSettings[key] = ref[1];
+        save_settings();
+    end
+end
+
+-- Sets up N evenly-weighted columns filling the current window's width,
+-- so the table always stretches to fit instead of leaving dead space.
+local function setupWeightedColumns(id, weights)
+    local winSize = { imgui.GetWindowSize() };
+    local availW  = winSize[1] - 16; -- rough padding allowance
+    imgui.Columns(#weights, id);
+    for i = 1, (#weights - 1) do
+        imgui.SetColumnWidth(i - 1, math.floor(availW * weights[i]));
+    end
+end
+
+------------------------------------------------------------
+-- Poll menu state every frame so we catch the shop closing entirely, even
+-- if LSB never sends a clean "closed" packet (confirmed: 0x086 only ever
+-- fires once, on open, never on close of any kind -- it's not usable as a
+-- close signal at all). Debounced since some submenu transitions can
+-- briefly read as "no menu" for a frame or two.
+------------------------------------------------------------
+local function updateMenuCloseState()
+    if (#gCurrentView == 0 and #gCurrentSellView == 0) then
+        return;
     end
 
-    if (gWindowVisible and #gCurrentView > 0) then
-        if (gPendingResize) then
-            imgui.SetNextWindowSize({ 560 * gSettings.ui_scale, 360 * gSettings.ui_scale }, ImGuiCond_Always);
-        else
-            imgui.SetNextWindowSize({ 560 * gSettings.ui_scale, 360 * gSettings.ui_scale }, ImGuiCond_FirstUseEver);
-        end
-        gWindowOpenRef[1] = true;
-        if (imgui.Begin('Guild Companion##guildcompanion', gWindowOpenRef)) then
+    if (getCurrentMenuName() == '') then
+        gMenuClosedFrames = gMenuClosedFrames + 1;
+    else
+        gMenuClosedFrames = 0;
+    end
 
+    if (gMenuClosedFrames < 15 or not gSettings.auto_hide_on_close) then
+        return;
+    end
+
+    gCurrentView      = T{};
+    gCurrentSellView  = T{};
+    gBuyAccum         = {};
+    gSellAccum        = {};
+    gMenuClosedFrames = 0;
+end
+
+------------------------------------------------------------
+-- Buy window: item / price / stock / range / restocks-per-day / days-to-best
+------------------------------------------------------------
+local function renderBuyWindow()
+    if (not gWindowVisible or #gCurrentView == 0) then
+        return;
+    end
+
+    applyScaledWindowSize(560, 360);
+    gWindowOpenRef[1] = true;
+    if (imgui.Begin('Guild Companion##guildcompanion', gWindowOpenRef)) then
         imgui.Text(gShopNpcName ~= '' and gShopNpcName or 'Guild Shop');
         if (#gCurrentSellView > 0) then
             imgui.SameLine();
@@ -696,27 +707,11 @@ ashita.events.register('d3d_present', 'guildcompanion_present', function ()
         imgui.PushItemWidth(200 * gSettings.ui_scale);
         imgui.InputText('Search##gc_search', gSearchText, 64);
         imgui.PopItemWidth();
-
-        local hideRef = { gSettings.hide_non_restocking };
-        if (imgui.Checkbox('Hide non-restocking items', hideRef)) then
-            gSettings.hide_non_restocking = hideRef[1];
-            save_settings();
-        end
-
+        settingsCheckbox('Hide non-restocking items', 'hide_non_restocking');
         imgui.Separator();
 
         local searchLower = gSearchText[1]:lower();
-
-        local winSize  = { imgui.GetWindowSize() };
-        local availW   = winSize[1] - 16; -- rough padding allowance
-        local weights  = { 0.26, 0.10, 0.10, 0.18, 0.16, 0.20 }; -- Item, Price, Stock, Price Range, Restocks/Day, Days->Best
-
-        imgui.Columns(6, 'gc_cols');
-        local runningW = 0;
-        for i = 1, (#weights - 1) do
-            runningW = runningW + math.floor(availW * weights[i]);
-            imgui.SetColumnWidth(i - 1, math.floor(availW * weights[i]));
-        end
+        setupWeightedColumns('gc_cols', { 0.26, 0.10, 0.10, 0.18, 0.16, 0.20 });
 
         imgui.Text('Item');          imgui.NextColumn();
         imgui.Text('Price');         imgui.NextColumn();
@@ -731,15 +726,14 @@ ashita.events.register('d3d_present', 'guildcompanion_present', function ()
             local matchesFilter = (not gSettings.hide_non_restocking) or row.restocks;
 
             if (matchesSearch and matchesFilter) then
-                imgui.Text(row.name);                          imgui.NextColumn();
-                imgui.Text(tostring(row.currentPrice));         imgui.NextColumn();
-                imgui.Text(fmtStock(row.stockBracket));         imgui.NextColumn();
-                imgui.Text(fmtRange(row.priceRange));           imgui.NextColumn();
-                imgui.Text(fmtRestock(row.restockPerDay));      imgui.NextColumn();
-                imgui.Text(fmtDays(row.daysToBest));            imgui.NextColumn();
+                imgui.Text(row.name);                     imgui.NextColumn();
+                imgui.Text(tostring(row.currentPrice));    imgui.NextColumn();
+                imgui.Text(fmtStock(row.stockBracket));    imgui.NextColumn();
+                imgui.Text(fmtRange(row.priceRange));      imgui.NextColumn();
+                imgui.Text(fmtRestock(row.restockPerDay)); imgui.NextColumn();
+                imgui.Text(fmtDays(row.daysToBest));       imgui.NextColumn();
             end
         end
-
         imgui.Columns(1);
     end
     imgui.End();
@@ -747,144 +741,127 @@ ashita.events.register('d3d_present', 'guildcompanion_present', function ()
     if (not gWindowOpenRef[1]) then
         gWindowVisible = false;
     end
+end
+
+------------------------------------------------------------
+-- Sell window: item / price / sell range / sellable / sell floor
+------------------------------------------------------------
+local function renderSellWindow()
+    if (not gSellWindowVisible or #gCurrentSellView == 0) then
+        return;
     end
 
-    local sellShouldRender = (gSellWindowVisible and #gCurrentSellView > 0);
-
-    if (sellShouldRender) then
-        if (gPendingResize) then
-            imgui.SetNextWindowSize({ 520 * gSettings.ui_scale, 320 * gSettings.ui_scale }, ImGuiCond_Always);
-        else
-            imgui.SetNextWindowSize({ 520 * gSettings.ui_scale, 320 * gSettings.ui_scale }, ImGuiCond_FirstUseEver);
+    applyScaledWindowSize(520, 320);
+    gSellWindowOpenRef[1] = true;
+    if (imgui.Begin('Guild Companion - Sell##guildcompanion_sell', gSellWindowOpenRef)) then
+        imgui.Text((gShopNpcName ~= '' and gShopNpcName or 'Guild Shop') .. ' (Selling)');
+        if (#gCurrentView > 0) then
+            imgui.SameLine();
+            if (imgui.SmallButton('Switch to Buy##gc_to_buy')) then
+                gWindowVisible     = true;
+                gSellWindowVisible = false;
+            end
         end
-        gSellWindowOpenRef[1] = true;
-        local sellBeginOk = imgui.Begin('Guild Companion - Sell##guildcompanion_sell', gSellWindowOpenRef);
-        if (sellBeginOk) then
+        imgui.Separator();
 
-            imgui.Text((gShopNpcName ~= '' and gShopNpcName or 'Guild Shop') .. ' (Selling)');
-            if (#gCurrentView > 0) then
-                imgui.SameLine();
-                if (imgui.SmallButton('Switch to Buy##gc_to_buy')) then
-                    gWindowVisible      = true;
-                    gSellWindowVisible  = false;
-                end
+        imgui.PushItemWidth(200 * gSettings.ui_scale);
+        imgui.InputText('Search##gc_sell_search', gSellSearchText, 64);
+        imgui.PopItemWidth();
+        settingsCheckbox('Only show items in my inventory', 'sell_inventory_only');
+
+        local searchLower = gSellSearchText[1]:lower();
+        local ownedItems  = gSettings.sell_inventory_only and getOwnedItemIdSet() or nil;
+
+        setupWeightedColumns('gc_sell_cols', { 0.28, 0.14, 0.20, 0.18, 0.20 });
+
+        imgui.Text('Item');       imgui.NextColumn();
+        imgui.Text('Price');      imgui.NextColumn();
+        imgui.Text('Sell Range'); imgui.NextColumn();
+        imgui.Text('Sellable');   imgui.NextColumn();
+        imgui.Text('Sell Floor'); imgui.NextColumn();
+        imgui.Separator();
+
+        for _, row in ipairs(gCurrentSellView) do
+            local matchesSearch    = (searchLower == '') or row.name:lower():find(searchLower, 1, true);
+            local matchesInventory = (not ownedItems) or ownedItems[row.itemId];
+
+            if (matchesSearch and matchesInventory) then
+                imgui.Text(row.name);                        imgui.NextColumn();
+                imgui.Text(tostring(row.currentPrice));       imgui.NextColumn();
+                imgui.Text(fmtRange(row.sellRange));          imgui.NextColumn();
+                imgui.Text(fmtSellable(row.sellable));        imgui.NextColumn();
+                imgui.Text(tostring(row.sellFloor or 'n/a')); imgui.NextColumn();
             end
-            imgui.Separator();
-
-            imgui.PushItemWidth(200 * gSettings.ui_scale);
-            imgui.InputText('Search##gc_sell_search', gSellSearchText, 64);
-            imgui.PopItemWidth();
-
-            local invOnlyRef = { gSettings.sell_inventory_only };
-            if (imgui.Checkbox('Only show items in my inventory', invOnlyRef)) then
-                gSettings.sell_inventory_only = invOnlyRef[1];
-                save_settings();
-            end
-
-            local sellSearchLower = gSellSearchText[1]:lower();
-            local ownedItems = gSettings.sell_inventory_only and getOwnedItemIdSet() or nil;
-
-            local sellWinSize = { imgui.GetWindowSize() };
-            local sellAvailW  = sellWinSize[1] - 16;
-            local sellWeights = { 0.28, 0.14, 0.20, 0.18, 0.20 }; -- Item, Price, Sell Range, Sellable, Sell Floor
-
-            imgui.Columns(5, 'gc_sell_cols');
-            for i = 1, (#sellWeights - 1) do
-                imgui.SetColumnWidth(i - 1, math.floor(sellAvailW * sellWeights[i]));
-            end
-
-            imgui.Text('Item');       imgui.NextColumn();
-            imgui.Text('Price');      imgui.NextColumn();
-            imgui.Text('Sell Range'); imgui.NextColumn();
-            imgui.Text('Sellable');   imgui.NextColumn();
-            imgui.Text('Sell Floor'); imgui.NextColumn();
-            imgui.Separator();
-
-            for _, row in ipairs(gCurrentSellView) do
-                local matchesSellSearch = (sellSearchLower == '') or row.name:lower():find(sellSearchLower, 1, true);
-                local matchesInventory  = (not ownedItems) or ownedItems[row.itemId];
-                if (matchesSellSearch and matchesInventory) then
-                    imgui.Text(row.name);                     imgui.NextColumn();
-                    imgui.Text(tostring(row.currentPrice));    imgui.NextColumn();
-                    imgui.Text(fmtRange(row.sellRange));       imgui.NextColumn();
-                    imgui.Text(fmtSellable(row.sellable));     imgui.NextColumn();
-                    imgui.Text(tostring(row.sellFloor or 'n/a')); imgui.NextColumn();
-                end
-            end
-
-            imgui.Columns(1);
         end
-        imgui.End();
+        imgui.Columns(1);
+    end
+    imgui.End();
 
-        if (not gSellWindowOpenRef[1]) then
-            gSellWindowVisible = false;
-        end
+    if (not gSellWindowOpenRef[1]) then
+        gSellWindowVisible = false;
+    end
+end
+
+------------------------------------------------------------
+-- Settings window: UI scale, behavior toggles, item order, reset
+------------------------------------------------------------
+local function renderSettingsWindow()
+    if (not gSettingsVisible) then
+        return;
     end
 
+    imgui.SetNextWindowSize({ 320, 280 }, ImGuiCond_FirstUseEver);
+    gSettingsOpenRef[1] = true;
+    if (imgui.Begin('Guild Companion Settings##gc_settings', gSettingsOpenRef)) then
+        local scaleRef = { gSettings.ui_scale };
+        imgui.PushItemWidth(200);
+        if (imgui.SliderFloat('##gc_uiscale', scaleRef, 0.5, 2.5, 'UI Scale: %.2f')) then
+            gSettings.ui_scale = scaleRef[1];
+            gPendingResize = true;
+            save_settings();
+        end
+        imgui.PopItemWidth();
+        imgui.TextColored({ 0.6, 0.6, 0.6, 1.0 }, 'Adjust if the window is too small/large for your resolution.');
+
+        imgui.Separator();
+        settingsCheckbox('Auto-hide when shop closes', 'auto_hide_on_close');
+        settingsCheckbox('Auto-switch between buy/sell windows', 'auto_switch_buy_sell');
+
+        imgui.Separator();
+        imgui.Text('Item order:');
+        local sortNativeRef = { gSettings.sort_order == 'native' };
+        if (imgui.Checkbox('Match in-game shop order', sortNativeRef)) then
+            gSettings.sort_order = sortNativeRef[1] and 'native' or 'alphabetical';
+            save_settings();
+        end
+        local sortAlphaRef = { gSettings.sort_order == 'alphabetical' };
+        if (imgui.Checkbox('Alphabetical', sortAlphaRef)) then
+            gSettings.sort_order = sortAlphaRef[1] and 'alphabetical' or 'native';
+            save_settings();
+        end
+
+        imgui.Separator();
+        settingsCheckbox('Show debug messages', 'debug_mode');
+
+        imgui.Separator();
+        if (imgui.Button('Reset to Default')) then
+            reset_settings();
+            gPendingResize = true;
+        end
+    end
+    imgui.End();
+
+    if (not gSettingsOpenRef[1]) then
+        gSettingsVisible = false;
+    end
+end
+
+ashita.events.register('d3d_present', 'guildcompanion_present', function ()
+    updateMenuCloseState();
+    renderBuyWindow();
+    renderSellWindow();
     gPendingResize = false;
-
-    if (gSettingsVisible) then
-        imgui.SetNextWindowSize({ 320, 280 }, ImGuiCond_FirstUseEver);
-        gSettingsOpenRef[1] = true;
-        if (imgui.Begin('Guild Companion Settings##gc_settings', gSettingsOpenRef)) then
-            local scaleRef = { gSettings.ui_scale };
-            imgui.PushItemWidth(200);
-            if (imgui.SliderFloat('##gc_uiscale', scaleRef, 0.5, 2.5, 'UI Scale: %.2f')) then
-                gSettings.ui_scale = scaleRef[1];
-                gPendingResize = true;
-                save_settings();
-            end
-            imgui.PopItemWidth();
-            imgui.TextColored({ 0.6, 0.6, 0.6, 1.0 },
-                'Adjust if the window is too small/large for your resolution.');
-
-            imgui.Separator();
-
-            local autoHideRef = { gSettings.auto_hide_on_close };
-            if (imgui.Checkbox('Auto-hide when shop closes', autoHideRef)) then
-                gSettings.auto_hide_on_close = autoHideRef[1];
-                save_settings();
-            end
-
-            local autoSwitchRef = { gSettings.auto_switch_buy_sell };
-            if (imgui.Checkbox('Auto-switch between buy/sell windows', autoSwitchRef)) then
-                gSettings.auto_switch_buy_sell = autoSwitchRef[1];
-                save_settings();
-            end
-
-            imgui.Separator();
-            imgui.Text('Item order:');
-            local sortNativeRef = { gSettings.sort_order == 'native' };
-            if (imgui.Checkbox('Match in-game shop order', sortNativeRef)) then
-                gSettings.sort_order = sortNativeRef[1] and 'native' or 'alphabetical';
-                save_settings();
-            end
-            local sortAlphaRef = { gSettings.sort_order == 'alphabetical' };
-            if (imgui.Checkbox('Alphabetical', sortAlphaRef)) then
-                gSettings.sort_order = sortAlphaRef[1] and 'alphabetical' or 'native';
-                save_settings();
-            end
-
-            imgui.Separator();
-
-            local debugRef = { gSettings.debug_mode };
-            if (imgui.Checkbox('Show debug messages', debugRef)) then
-                gSettings.debug_mode = debugRef[1];
-                save_settings();
-            end
-
-            imgui.Separator();
-            if (imgui.Button('Reset to Default')) then
-                reset_settings();
-                gPendingResize = true;
-            end
-        end
-        imgui.End();
-
-        if (not gSettingsOpenRef[1]) then
-            gSettingsVisible = false;
-        end
-    end
+    renderSettingsWindow();
 end);
 
 local function print_help()
@@ -901,39 +878,29 @@ local function print_help()
     print(chat.header('GuildCompanion') .. chat.message('  /gc unload   -- unload the addon'));
 end
 
-ashita.events.register('command', 'guildcompanion_command', function (e)
-    local args = e.command:args();
-    if (#args == 0 or (args[1]:lower() ~= '/guildcompanion' and args[1]:lower() ~= '/gc')) then
-        return;
-    end
-    e.blocked = true;
-
-    if (args[2] and args[2]:lower() == 'unload') then
+local commandHandlers = {
+    unload = function()
         AshitaCore:GetChatManager():QueueCommand(-1, '/addon unload guildcompanion');
-        return;
-    end
+    end,
 
-    if (args[2] and args[2]:lower() == 'toggle') then
+    toggle = function()
         gWindowVisible = not gWindowVisible;
         print(chat.header('GuildCompanion') .. chat.message('Window ' .. (gWindowVisible and 'shown' or 'hidden') .. '.'));
-        return;
-    end
+    end,
 
-    if (args[2] and args[2]:lower() == 'sell') then
+    sell = function()
         gSellWindowVisible = true;
         gWindowVisible     = false;
         print(chat.header('GuildCompanion') .. chat.message('Switched to sell window.'));
-        return;
-    end
+    end,
 
-    if (args[2] and args[2]:lower() == 'buy') then
-        gWindowVisible      = true;
-        gSellWindowVisible  = false;
+    buy = function()
+        gWindowVisible     = true;
+        gSellWindowVisible = false;
         print(chat.header('GuildCompanion') .. chat.message('Switched to buy window.'));
-        return;
-    end
+    end,
 
-    if (args[2] and args[2]:lower() == 'debug') then
+    debug = function()
         print(chat.header('GuildCompanion') .. chat.message(string.format(
             'npc="%s" resolved=%s | buy: visible=%s rows=%d | sell: visible=%s rows=%d | menu="%s" closedFrames=%d',
             tostring(gShopNpcName),
@@ -941,25 +908,35 @@ ashita.events.register('command', 'guildcompanion_command', function (e)
             tostring(gWindowVisible), #gCurrentView,
             tostring(gSellWindowVisible), #gCurrentSellView,
             tostring(getCurrentMenuName()), gMenuClosedFrames)));
-        return;
-    end
+    end,
 
-    if (args[2] and args[2]:lower() == 'autohide') then
+    autohide = function()
         gSettings.auto_hide_on_close = not gSettings.auto_hide_on_close;
         save_settings();
-        print(chat.header('GuildCompanion') .. chat.message('Auto-hide on shop close: ' .. (gSettings.auto_hide_on_close and 'ON' or 'OFF') .. '.'));
-        return;
-    end
+        print(chat.header('GuildCompanion') .. chat.message(
+            'Auto-hide on shop close: ' .. (gSettings.auto_hide_on_close and 'ON' or 'OFF') .. '.'));
+    end,
 
-    if (args[2] and args[2]:lower() == 'settings') then
+    settings = function()
         print_help();
         gSettingsVisible = not gSettingsVisible;
-        return;
-    end
+    end,
 
-    if (args[2] and args[2]:lower() == 'help') then
+    help = function()
         print_help();
         gSettingsVisible = not gSettingsVisible;
+    end,
+};
+
+ashita.events.register('command', 'guildcompanion_command', function (e)
+    local args = e.command:args();
+    if (#args == 0 or (args[1]:lower() ~= '/guildcompanion' and args[1]:lower() ~= '/gc')) then
         return;
+    end
+    e.blocked = true;
+
+    local handler = args[2] and commandHandlers[args[2]:lower()];
+    if (handler) then
+        handler();
     end
 end);
