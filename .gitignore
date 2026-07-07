@@ -1,0 +1,7 @@
+# Ashita per-character/per-server generated settings (not part of the addon itself)
+config/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
