@@ -1,6 +1,6 @@
 # GuildCompanion
 
-A read-only Ashita v4 addon for FFXI guild shops.
+A read-only Ashita v4 addon for era FFXI guild shops.
 
 - Full price range for every item (min/max across the whole stock curve)
 - Estimated current stock, derived from the price the shop is currently showing you
