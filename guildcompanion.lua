@@ -1,7 +1,7 @@
 addon.name    = 'GuildCompanion';
 addon.author  = 'Monti';
 addon.version = '1.0';
-addon.desc    = 'Read-only info popup for guild shops: price range, days-to-best-price, and cheaper-elsewhere check.';
+addon.desc    = 'Read-only info popup for guild shops: price range, start-of-day stock, and restock values';
 addon.link    = '';
 
 require('common');
