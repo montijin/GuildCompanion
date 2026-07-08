@@ -56,4 +56,4 @@ Accessible via `/gc settings`, persisted to `config/addons/GuildCompanion/settin
 
 ## Credits
 
-Built by Monti. Thanks to Sruon for pointing me in the right direction for memory and packet info as well as creating a very readable guild shop function for LSB. 
+Thanks to Sruon for pointing me in the right direction for memory and packet info as well as creating a very readable guild shop function for LSB. 
