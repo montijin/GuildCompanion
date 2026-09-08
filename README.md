@@ -8,7 +8,7 @@ A read-only Ashita v4 addon for era FFXI guild shops.
 - How many units you can sell before hitting the shop's cap, and how many can be sold *always* even if the cap was reached on the previous day
 - Search and filtering (hide non-restocking items, show only items in your inventory)
 
-GuildCompanion never reads game state to act on your behalf — it doesn't inject packets, doesn't interact with the shop menu, and doesn't automate buying or selling. It only reads the same data your client already receives and does the math for you. GuildCompanion cannot see what the actual stock of items are. The stock is entirely derived from reverse calculating the price the items opened with on day change.
+GuildCompanion never reads game state to act on your behalf; it doesn't inject packets, doesn't interact with the shop menu, and doesn't automate buying or selling. It only reads the same data your client already receives and does the math for you. GuildCompanion cannot see what the actual stock of items are. The stock is entirely derived from reverse calculating the price the items opened with on day change.
 
 ## Requirements
 
