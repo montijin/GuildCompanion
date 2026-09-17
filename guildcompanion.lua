@@ -1,7 +1,7 @@
 addon.name    = 'GuildCompanion';
 addon.author  = 'Monti';
 addon.version = '1.0';
-addon.desc    = 'Read-only info popup for guild shops: price range, start-of-day stock, and restock values';
+addon.desc    = 'Read-only info popup for guild shops: price range, days-to-best-price, and cheaper-elsewhere check.';
 addon.link    = '';
 
 require('common');
@@ -174,9 +174,29 @@ end
 -- defaults to 45, but targetStock=35 and the lowest price ever seen,
 -- 1288, only occurs at stock=35 -- never at 45).
 ------------------------------------------------------------
-local function reverseStockFromPrice(observedPrice, buyMax, priceFloor, targetStock, maxStock)
+-- Approximation: real stock isn't guaranteed to stay at or above restockRate
+-- (a fresh boot sets stock=cfg.initial, which can be below restockRate; and
+-- purchases can deplete stock further within a day), but restockRate is
+-- treated as the floor anyway -- closer to true in the common case than
+-- assuming stock=0. Refined with the item's documented `initial` stock
+-- (from era_guild_shops.lua/guild_shops.lua -- public source data, not
+-- packet-derived): if initial is lower than restockRate, that's a real,
+-- known low point (day-one boot state), so the floor uses whichever of the
+-- two is lower instead of restockRate alone.
+local function minStockFloor(restockRate, initial)
+    local floor = 0;
+    if (restockRate and restockRate > 0) then
+        floor = restockRate;
+    end
+    if (initial and initial >= 0 and initial < floor) then
+        floor = initial;
+    end
+    return floor;
+end
+
+local function reverseStockFromPrice(observedPrice, buyMax, priceFloor, targetStock, maxStock, restockRate, initial)
     local lo, hi = nil, nil;
-    for s = 0, targetStock do
+    for s = minStockFloor(restockRate, initial), targetStock do
         if (calcBuyPrice(buyMax, priceFloor, maxStock, s) == observedPrice) then
             lo = lo or s;
             hi = s;
@@ -203,14 +223,17 @@ end
 
 ------------------------------------------------------------
 -- Reverse lookup for the sell side: given the price the packet reports,
--- find which current stock level(s) produce it. Buying and selling share
--- one stock pool, so current stock can be anywhere in [0, maxStock] --
--- not just [targetStock, maxStock] -- if other players have been buying
--- that same day. searchFloor is normally 0; callers may narrow it.
+-- find which current stock level(s) produce it. searchFloor is normally 0
+-- since buying can push current stock down below targetStock during the
+-- day; searchCeil should be targetStock, NOT maxStock -- rollShopDay always
+-- clamps stock to at most targetStock right before locking in sellPrice for
+-- the day, so the price can never have been generated from a stock above
+-- targetStock, even though the live stock byte itself can drift above it
+-- later in the day from player selling.
 ------------------------------------------------------------
-local function reverseStockFromSellPrice(observedPrice, base, maxStock, searchFloor)
+local function reverseStockFromSellPrice(observedPrice, base, maxStock, searchFloor, searchCeil)
     local lo, hi = nil, nil;
-    for s = searchFloor, maxStock do
+    for s = searchFloor, searchCeil do
         if (calcSellPrice(base, maxStock, s) == observedPrice) then
             lo = lo or s;
             hi = s;
@@ -242,9 +265,13 @@ local function evaluateItem(npcItems, itemId, observedPrice)
         };
     end
 
-    local lo, hi   = reverseStockFromPrice(observedPrice, d.buyMax, d.priceFloor, d.targetStock, d.maxStock);
+    -- Everything below is inferred purely from the observed packet price via
+    -- the public price curve -- deliberately never reads the packet's raw
+    -- stock bytes, even though they're present in the struct. This addon
+    -- only shows what a player could work out themselves from price alone.
+    local lo, hi   = reverseStockFromPrice(observedPrice, d.buyMax, d.priceFloor, d.targetStock, d.maxStock, d.restockRate, d.initial);
     local minPrice = calcBuyPrice(d.buyMax, d.priceFloor, d.maxStock, d.targetStock);
-    local maxPrice = calcBuyPrice(d.buyMax, d.priceFloor, d.maxStock, 0);
+    local maxPrice = calcBuyPrice(d.buyMax, d.priceFloor, d.maxStock, minStockFloor(d.restockRate, d.initial));
 
     local daysLo, daysHi = nil, nil;
     if (d.restockRate > 0 and lo and hi) then
@@ -312,21 +339,16 @@ local function evaluateSellItem(npcItems, itemId, observedPrice)
     local maxStock    = d.maxStock;
     local targetStock = d.targetStock or maxStock;
 
-    -- IMPORTANT: buying and selling share the same stock pool. Even for a
-    -- normally-restocking item, other players buying it that same day can
-    -- push current stock BELOW targetStock -- the daily roll only resets
-    -- stock to targetStock at the start of the day, not continuously. So
-    -- the real achievable range for current stock is always [0, maxStock],
-    -- never just [targetStock, maxStock] -- restricting to targetStock+
-    -- was causing "n/a" for any item whose price reflected stock pushed
-    -- low by buying activity.
-    local lo, hi = reverseStockFromSellPrice(observedPrice, d.baseSell, maxStock, 0);
+    -- Search [0, targetStock]: buying can push current stock below targetStock
+    -- during the day, but the shop can never OPEN above targetStock -- rollShopDay
+    -- always clamps stock down to targetStock before locking in today's price.
+    local lo, hi = reverseStockFromSellPrice(observedPrice, d.baseSell, maxStock, 0, targetStock);
 
-    local minPrice = calcSellPrice(d.baseSell, maxStock, maxStock); -- floor: full shelf
+    local minPrice = calcSellPrice(d.baseSell, maxStock, targetStock); -- floor: the shop can never open above targetStock
     local maxPrice = calcSellPrice(d.baseSell, maxStock, 0); -- ceiling: shelf completely empty
 
-    local sellable  = hi and (maxStock - hi) or nil;
     local sellFloor = maxStock - targetStock;
+    local sellable  = hi and (maxStock - hi) or nil;
 
     return {
         itemId       = itemId,
@@ -643,6 +665,14 @@ local function settingsCheckbox(label, key)
     end
 end
 
+-- Column header text with a hover tooltip explaining what the column means.
+local function headerWithTooltip(label, tooltip)
+    imgui.Text(label);
+    if (imgui.IsItemHovered()) then
+        imgui.SetTooltip(tooltip);
+    end
+end
+
 -- Sets up N evenly-weighted columns filling the current window's width,
 -- so the table always stretches to fit instead of leaving dead space.
 local function setupWeightedColumns(id, weights)
@@ -715,10 +745,10 @@ local function renderBuyWindow()
 
         imgui.Text('Item');          imgui.NextColumn();
         imgui.Text('Price');         imgui.NextColumn();
-        imgui.Text('Stock');         imgui.NextColumn();
-        imgui.Text('Price Range');   imgui.NextColumn();
-        imgui.Text('Restocks/Day');  imgui.NextColumn();
-        imgui.Text('Days->Best');    imgui.NextColumn();
+        headerWithTooltip('Stock', 'The number of items that were in the shop at the start of the current game day'); imgui.NextColumn();
+        headerWithTooltip('Price Range', 'The minimum and maximum prices that the item can be purchased for'); imgui.NextColumn();
+        headerWithTooltip('Restocks/Day', 'How many of each item is naturally replenished by the server (not by players!) each day.'); imgui.NextColumn();
+        headerWithTooltip('Days->Best', 'How many game days it would take to get to the minimum price if no players on the server bought any.'); imgui.NextColumn();
         imgui.Separator();
 
         for _, row in ipairs(gCurrentView) do
@@ -776,9 +806,9 @@ local function renderSellWindow()
 
         imgui.Text('Item');       imgui.NextColumn();
         imgui.Text('Price');      imgui.NextColumn();
-        imgui.Text('Sell Range'); imgui.NextColumn();
-        imgui.Text('Sellable');   imgui.NextColumn();
-        imgui.Text('Sell Floor'); imgui.NextColumn();
+        headerWithTooltip('Sell Range', 'The minimum and maximum prices that the guild shop will give you for the item. Lower stock = higher prices.'); imgui.NextColumn();
+        headerWithTooltip('Sellable', 'How many of the item players could sell to the guild at the start of the game day.'); imgui.NextColumn();
+        headerWithTooltip('Sell Floor', 'The number of items the shop will buy from players no matter if the stock was filled the previous day'); imgui.NextColumn();
         imgui.Separator();
 
         for _, row in ipairs(gCurrentSellView) do
@@ -875,6 +905,7 @@ local function print_help()
     print(chat.header('GuildCompanion') .. chat.message('  /gc settings -- open the settings window'));
     print(chat.header('GuildCompanion') .. chat.message('  /gc help     -- show this message and open settings'));
     print(chat.header('GuildCompanion') .. chat.message('  /gc debug    -- print current internal state (for troubleshooting)'));
+    print(chat.header('GuildCompanion') .. chat.message('  /gc regen    -- regenerate shop_data.lua from data/guild_shops.lua, era_guild_shops.lua, item_basic.sql (and pre_rmt_basesell_vendor_revert.sql, if present)'));
     print(chat.header('GuildCompanion') .. chat.message('  /gc unload   -- unload the addon'));
 end
 
@@ -915,6 +946,38 @@ local commandHandlers = {
         save_settings();
         print(chat.header('GuildCompanion') .. chat.message(
             'Auto-hide on shop close: ' .. (gSettings.auto_hide_on_close and 'ON' or 'OFF') .. '.'));
+    end,
+
+    regen = function()
+        local dataDir = string.format('%saddons/%s/data/', AshitaCore:GetInstallPath(), addon.name);
+        local genPath = dataDir .. 'generate_shop_data.lua';
+
+        local chunk, loadErr = loadfile(genPath);
+        if (not chunk) then
+            print(chat.header('GuildCompanion') .. chat.message(
+                'Could not load generate_shop_data.lua: ' .. tostring(loadErr)));
+            return;
+        end
+
+        print(chat.header('GuildCompanion') .. chat.message('Regenerating shop_data.lua...'));
+
+        local function log(msg)
+            print(chat.header('GuildCompanion') .. chat.message(tostring(msg)));
+        end
+
+        local ok, result = pcall(chunk, dataDir, log);
+        if (not ok) then
+            print(chat.header('GuildCompanion') .. chat.message('Regeneration crashed: ' .. tostring(result)));
+            return;
+        end
+        if (not result or not result.ok) then
+            print(chat.header('GuildCompanion') .. chat.message(
+                'Regeneration failed: ' .. tostring(result and result.error or 'unknown error')));
+            return;
+        end
+
+        print(chat.header('GuildCompanion') .. chat.message(
+            'Done. Run /addon reload guildcompanion to pick up the new data.'));
     end,
 
     settings = function()
